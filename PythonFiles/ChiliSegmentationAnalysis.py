@@ -11,11 +11,9 @@ import time
 import heapq
 import os
 from scipy.ndimage import binary_fill_holes
+from torchvision.transforms import InterpolationMode
 
 from ChiliDataset import ChiliData
-
-
-
 
 # ================================
 # Morphology Configuration
@@ -213,15 +211,20 @@ normalizeTransform = transforms.Compose([
     )
 ])
 
+resizeTransform = transforms.Compose([
+    transforms.Resize(imageResize, interpolation=InterpolationMode.NEAREST),
+])
+
+
 # path definitions for image and model locations
 
-datasetPath = "C:/Python/PyTorchSegmentation/ChiliData/Video 1"
+datasetPath = "C:/Python/PyTorchSegmentation/ChiliData/Video 1/"
 numClasses = 4
 
 testDataset = ChiliData(
     datasetPath,
     split="single",
-    transform=normalizeTransform
+    transform=normalizeTransform, target_transform= resizeTransform
 )
 
 testLoader = DataLoader(
