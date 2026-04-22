@@ -34,7 +34,7 @@ When downloading the images, ensure that they are placed in a file path outside 
 **2.** Ensure that when you download this, the python files go into your project and the model and images go into the same folder, which does not have to be your 
    python project. Below is the filepath used for the project:
 
-  Images: C:/Python/PytorchSegmentation/ChiliData/... (Replace ... with the Images folder in this repository)
+  Images: C:/Python/PytorchSegmentation/ChiliData/... (Replace ... with the Video 1 folder in this repository)
 
   Model: C:/Python/PytorchSegmentation/... (Replace ... with the ModelSaves folder in this repository)
 
