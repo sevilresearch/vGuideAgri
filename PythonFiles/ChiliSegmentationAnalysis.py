@@ -1,444 +1,575 @@
+
 import torch
 from torch.utils.data import DataLoader
 from torchvision.models.segmentation.deeplabv3 import DeepLabHead
 from torchvision import models
 from torchvision import transforms
-from torchvision import datasets
-import numpy as np
 import matplotlib.pyplot as plt
+import numpy as np
 import cv2
 import time
+import heapq
+import os
+from scipy.ndimage import binary_fill_holes
 
-from torchvision.transforms import InterpolationMode
-
-from Rellis3DDatasetWithLidar import Rellis3D
-#from Rellis3DDataset import Rellis3D
-from TestDataset import TestData
 from ChiliDataset import ChiliData
-from LidarProcessing import LidarProcessor
-import floodfill
-from PathingProcessing import PathingProcessor
 
-#dataset = "Rellis3D"
-#modelset = "Rellis3D"
-modelset = "ChiliData"
-dataset = "ChiliData"
-modelSavesPath = "C:/Python/PyTorchSegmentation/ModelSaves/"
-segmentationsPath = "C:/Python/PyTorchSegmentation/Segmentations/"
-imageSize = (1200, 1920)
-imageResize = (640, 1024)
-# imageResize = (256, 512)
 
-# pathingType = "StraightLine"
-# pathingType = "MyAlg"
-pathingType = "AStar"
-# pathingType = "MaxSafe"
-#pathingType = "None"
 
-# device = torch.device('cuda' if torch.cuda.is_available() else 'cpu'
-device = torch.device("cpu")
 
-# Function to Calculate IoU
+# ================================
+# Morphology Configuration
+# ================================
 
-def compute_iou(pred, target, num_classes):
-    pred = pred.view(-1)
-    target = target.view(-1)
+MORPH_OPERATION = "close"
+KERNEL_SHAPE = "circle"
+KERNEL_SIZE = 5
 
-    per_class = [0]*num_classes
-    ious = []
+APPLY_EROSION = False
+APPLY_IMFILL = False
 
-    for cls in range(num_classes):
-        pred_inds = (pred == cls)
-        target_inds = (target == cls)
 
-        intersection = (pred_inds & target_inds).sum().item()
-        union = (pred_inds | target_inds).sum().item()
+# ================================
+# Safety Margin
+# ================================
 
-        if union == 0:
+SAFETY_KERNEL_SIZE = 7
+
+
+# ================================
+# Kernel Builder
+# ================================
+
+def get_kernel():
+
+    if KERNEL_SHAPE == "square":
+        return np.ones((KERNEL_SIZE, KERNEL_SIZE), np.uint8)
+
+    elif KERNEL_SHAPE == "circle":
+        return cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (KERNEL_SIZE, KERNEL_SIZE)
+        )
+
+
+# ================================
+# Safe Class-wise Morphology
+# ================================
+
+def apply_morphology(mask):
+
+# Applies morph operations using the parameters defined above
+    kernel = get_kernel()
+
+    refinedMask = np.zeros_like(mask)
+
+    for c in range(numClasses):
+
+        classMask = (mask == c).astype(np.uint8)
+
+        if MORPH_OPERATION == "open":
+            classMask = cv2.morphologyEx(classMask, cv2.MORPH_OPEN, kernel)
+
+        if APPLY_EROSION:
+            classMask = cv2.erode(classMask, kernel)
+
+        if APPLY_IMFILL:
+            classMask = binary_fill_holes(classMask).astype(np.uint8)
+
+        refinedMask[classMask == 1] = c
+
+    return refinedMask
+
+
+# ================================
+# A* Path Planner
+# ================================
+
+def astar(cost, start, goal):
+# Pathing calculation
+    h, w = cost.shape
+    visited = np.zeros((h,w), dtype=bool)
+
+    pq = []
+    heapq.heappush(pq,(0,start))
+
+    parent = {}
+    gscore = {start:0}
+
+    directions = [(1,0),(-1,0),(0,1),(0,-1)]
+
+    while pq:
+
+        _, current = heapq.heappop(pq)
+
+        if current == goal:
+            break
+
+        if visited[current]:
             continue
 
-        iou = intersection / union
-        per_class[cls] = iou
-        ious.append(iou)
+        visited[current] = True
 
-    if len(ious) == 0:
-        return 0.0, per_class
+        for dy,dx in directions:
 
-    return sum(ious)/len(ious), per_class
+            ny = current[0] + dy
+            nx = current[1] + dx
+
+            if ny < 0 or ny >= h or nx < 0 or nx >= w:
+                continue
+
+            new_cost = gscore[current] + cost[ny,nx]
+
+            if (ny,nx) not in gscore or new_cost < gscore[(ny,nx)]:
+
+                gscore[(ny,nx)] = new_cost
+                priority = new_cost + abs(goal[0]-ny) + abs(goal[1]-nx)
+
+                heapq.heappush(pq,(priority,(ny,nx)))
+                parent[(ny,nx)] = current
+
+    path = []
+    node = goal
+
+    while node in parent:
+        path.append(node)
+        node = parent[node]
+
+    return path
 
 
-resizeTransform = transforms.Compose([
-    transforms.Resize(imageResize, interpolation=InterpolationMode.NEAREST),
-])
+# ================================
+# Furthest Reachable Pixel
+# ================================
+
+def find_furthest_reachable(traversabilityImage, start):
+
+    h, w = traversabilityImage.shape
+    visited = np.zeros((h,w), dtype=bool)
+
+    queue = [start]
+    visited[start] = True
+
+    furthest = start
+
+    directions = [(1,0),(-1,0),(0,1),(0,-1)]
+
+    while queue:
+
+        y,x = queue.pop(0)
+
+        if y < furthest[0]:
+            furthest = (y,x)
+
+        for dy,dx in directions:
+
+            ny = y + dy
+            nx = x + dx
+
+            if ny < 0 or ny >= h or nx < 0 or nx >= w:
+                continue
+
+            if visited[ny,nx]:
+                continue
+
+            if traversabilityImage[ny,nx] == 0:
+                continue
+
+            visited[ny,nx] = True
+            queue.append((ny,nx))
+
+    return furthest
+
+
+ # Start of code
+# ================================
+# Dataset Setup
+# ================================
+
+dataset = "ChiliData"
+modelset = "ChiliData"
+
+modelSavesPath = "C:/Python/PyTorchSegmentation/ModelSaves/"
+segmentationsPath = "C:/Python/PyTorchSegmentation/Segmentations/"
+
+preFolder = os.path.join(segmentationsPath,"pre")
+morphFolder = os.path.join(segmentationsPath,"morph")
+pathFolder = os.path.join(segmentationsPath,"path")
+
+os.makedirs(preFolder,exist_ok=True)
+os.makedirs(morphFolder,exist_ok=True)
+os.makedirs(pathFolder,exist_ok=True)
+
+imageResize = (256,512)
+
+device = torch.device("cpu") # Define device
 
 normalizeTransform = transforms.Compose([
     transforms.Resize(imageResize),
     transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std = [0.229, 0.224, 0.225])
+    transforms.Normalize(
+        mean=[0.485,0.456,0.406],
+        std=[0.229,0.224,0.225]
+    )
 ])
 
-# Dataset definition
-datasetPath = ""
-numClasses = 0
-testDataset = None
+# path definitions for image and model locations
 
-if dataset == "Rellis3D":
-    datasetPath = "C:/Python/PyTorchSegmentation/Rellis3D/Images"
-    numClasses = 19
-    testDataset = Rellis3D(datasetPath, split = "val",
-                           transform=normalizeTransform, target_transform=resizeTransform)
-elif dataset == "SelfTest":
-    datasetPath = "C:/Python/PyTorchSegmentation/TestImages/"
-    numClasses = 19
-    testDataset = TestData(datasetPath, split = "test",transform=normalizeTransform, target_transform=resizeTransform)
-elif dataset == "ChiliData":
-    datasetPath = "C:/Python/PyTorchSegmentation/ChiliData/video 2/"
-    numClasses = 4
-    testDataset = ChiliData(datasetPath, split="test", transform=normalizeTransform, target_transform=resizeTransform)
-else:
-    print("Error: Please define a valid dataset")
-    exit(0)
+datasetPath = "C:/Python/PyTorchSegmentation/ChiliData/Video 1"
+numClasses = 4
 
-# Metric Storage for Plotting
+testDataset = ChiliData(
+    datasetPath,
+    split="single",
+    transform=normalizeTransform
+)
 
-rawIntersectionCounts = torch.zeros(numClasses)
-rawUnionCounts = torch.zeros(numClasses)
-PerClassIoU = [[] for _ in range(numClasses)]
+testLoader = DataLoader(
+    testDataset,
+    batch_size=1,
+    shuffle=False
+)
 
-MorphIoU = []
-PreIoU = []
-PathLengthPerImage = []
-RuntimePerImage = []
-PixelAccuracyPerImage = []
 
-testSampler = torch.utils.data.SequentialSampler(testDataset)
-testDataLoader = torch.utils.data.DataLoader(testDataset, batch_size=1, sampler=testSampler)
+# ================================
+# Load Model
+# ================================
 
 segmentationModel = models.segmentation.deeplabv3_resnet101(pretrained=True)
 segmentationModel.classifier = DeepLabHead(2048, numClasses)
+
 segmentationModel.load_state_dict(
-    torch.load(modelSavesPath + "DeeplabV3" + modelset + "-0-0.963252067565918.pth", map_location=torch.device('cpu'))
+    torch.load(
+        modelSavesPath +
+        "DeeplabV3" +
+        modelset +
+        "-0-0.963252067565918.pth",
+        map_location=device
+    )
 )
 
 segmentationModel.eval()
 segmentationModel.to(device)
 
-kvals = [5]
-# kvals = [5, 25, 50, 55, 100, 150, 200]
-
-element = "Circle"
-operation = "Open"
-rundescriptor_abrv = element + operation
-# rundescriptor = "Morphological Opening w/ " + element + "Structuring Element and Imfill"
-
-for runksize in kvals:
-    imagesTested = 0
-    numImages = len(testDataLoader)
-    cumulativePathingCalculationTime = 0
-    totalPathLength = 0
-    totalNumPaths = 0
-    totalUnsafePathPixels = 0
-
-    # lidarProcessor = LidarProcessor(datasetPath, imageSize, imageResize)
-    pathingProcessor = PathingProcessor()
-
-    # This is a definition of the colors for each segmentation class (19)
-    classColorLookupTable = [
-        [51,221,255], [22,160,75], [102,255,102], [144,107,40]]
-
-
-
-    nontraversable = [0, 0, 0]
-    traversable = [0, 0, 255]
-    # sky = [128, 255, 255]
-    # obstacles = [128, 128, 128]
-
-    # These are the traversability classifications for each segmentation class
-    traversabilityLookupTable = [
-        nontraversable, nontraversable, nontraversable, traversable]
-
-    # table = np.array([((i / 255.0)) * 255 fir i in np.arange(0, 256)]).astype("uint8")
-
-    identity = np.arange(256, dtype=np.dtype('uint8'))
-    zeros = np.zeros(256, np.dtype('uint8'))
-    lut = np.dstack((identity, identity, zeros))
-
-    for i in range(256 - len(classColorLookupTable)):
-        classColorLookupTable.append([0, 0, 0])
-        traversabilityLookupTable.append([0, 0, 0])
-
-    overallStart = time.time()
-
- # add index, testBatch, targetBatch, pointCloud, transformType back in front of targetBatch when using lidar
-    for testBatch, targetBatch in testDataLoader:
-        individualStart = time.time()
-        if(imagesTested % 20) == 0:
-            print("Processing image " + str(imagesTested) + " out of " + str(numImages) + ".")
-
-        testBatch = testBatch.to(device)
-
-        with torch.no_grad():
-            outputBatch = segmentationModel(testBatch)["out"]
-
-        outputBatchPredictions = outputBatch.argmax(1)
-        targetBatch = targetBatch.squeeze(1)
-        testImage, targetImage, outputImage = (testBatch[0].to("cpu"), targetBatch[0].to("cpu"),
-                                               outputBatchPredictions[0].to("cpu"))
-        rawPred = outputImage.clone()  # (H, W) class indices
-
-        #print("Pixel accuracy:", (rawPred == target_resized).float().mean().item())
-
-        morph_np = rawPred.numpy().astype(np.uint8)
-        if rawPred.shape != targetImage.shape:
-            target_np = targetImage.numpy()
-            target_np = cv2.resize(
-                target_np,
-                (rawPred.shape[1], rawPred.shape[0]),
-                interpolation=cv2.INTER_NEAREST
-            )
-            target_resized = torch.from_numpy(target_np).long()
-        else:
-            target_resized = targetImage
-
-        pre_iou, per_class = compute_iou(rawPred, target_resized, numClasses)
-        PreIoU.append(pre_iou)
-        for c in range(numClasses):
-            PerClassIoU[c].append(per_class[c])
-
-        # plt.imsave(segmentationsPath + tempExamples4/Seg" + str(imagesTested) + "-PRE1.png", np.uint8(outputImage))
-
-        # imfill (before morphological operations)
-        # outputImage = floodfill.from_edges(outputImage, four_way=True)
-        # plt.imsave(segmentationsPath + "tempExamples4/Seg" + str(imagesTested) + "-imfill" + " k" + str(runksize) +
-        # str(rundescriptor_abrv) + ".png" + np.uint8(outputImage))
-
-        #grayscale ->RGB
-        outputImage = cv2.cvtColor(np.uint8(np.asarray(outputImage)), cv2.COLOR_GRAY2RGB)
-        plt.imsave(segmentationsPath + "tempExamples4/Seg" + str(imagesTested) + "-PRE2.png", np.uint8(outputImage))
-
-        # begin post-Rellis Segmentation Morphology Operations
-        # morph open
-        morph_np = cv2.morphologyEx(morph_np, cv2.MORPH_OPEN, np.ones((30,30), np.uint8))
-        morph_np = cv2.morphologyEx(morph_np, cv2.MORPH_OPEN, np.ones((runksize, runksize), np.uint8))
-        morph_np = cv2.morphologyEx(morph_np, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (runksize, runksize)))
-        plt.imsave(segmentationsPath + "tempExamples4/Seg" + str(imagesTested) + "open k" + str(runksize) + str(rundescriptor_abrv) + ".png", np.uint8(outputImage))
-
-        #morph close
-        # morph_np = cv2.morphologyEx(morph_np, cv2.MORPH_CLOSE, np.ones((30,30), np.uint8))
-        # morph_np = cv2.morphologyEx(morph_np, cv2.MORPH_CLOSE, np.ones((runksize, runksize), np.uint8))
-        # morph_np = cv2.morphologyEx(morph_np, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (runksize, runksize)))
-        # plt.imsave(segmentationsPath + "tempexamples4/Seg" + str(imagesTested) + "close k" + str(runksize) + str(rundescriptor_abrv) + ".png", np.uint8(outputImage))
-
-        # imfill (after morphological operations)
-        # morph_np = cv2.cvtColor(np.uint8(np.asarray(morph_np)), cv2.COLOR_GRAY2RGB)
-        # plt.imsave(segmentationsPath + "tempExamples4/Seg" + str(imagesTested) + "-imfill" + " k" + str(runksize) + str(rundescriptor_abrv) + ".png", np.uint8(outputImage))
-
-        # erosion
-        # morph_np = cv2.erode(morph_np, np.ones((runksize, runksize), np.uint8))
-        # morph_np = cv2.erode(morph_np, cv2.getStructureElement(cv2.MORPH_ELLIPSE, (runksize, runksize)), np.uint8))
-        # plt.imsave(segmentationsPath + "tempExamples4/Seg" + str(imagesTested) + "MorphE.png", np.uint(outputImage))
-        # end erosion
-
-        # end Post-Rellis Segmentation Morphology Operations
-        morph_rgb = cv2.cvtColor(morph_np, cv2.COLOR_GRAY2RGB)
-
-        plt.imsave(
-            segmentationsPath + "tempExamples4/Seg" + str(imagesTested) +
-            "open k" + str(runksize) + str(rundescriptor_abrv) + ".png",
-            np.uint8(morph_rgb)
-        )
-        # Post morph IoU
-        morph_tensor = torch.from_numpy(morph_np).long()
-        post_iou, _ = compute_iou(morph_tensor, target_resized, numClasses)
-        MorphIoU.append(post_iou)
-
-        traversabilityImage = outputImage
-        outputImage = cv2.LUT(outputImage, np.array([classColorLookupTable]))
-        plt.imsave(segmentationsPath + "tempExamples4/Seg" + str(imagesTested) + " k" + str(runksize) + "-PRE3.png", np.uint8(outputImage))
-
-        traversabilityImage = cv2.LUT(traversabilityImage, np.array([traversabilityLookupTable]))
-        #plt.imsave(segmentationsPath + "tempExamples4/Seg" + str(imagesTested) + " k" + str(runksize) + "-PRE4.png", np.uint8(traversabilityImage))
-        traversabilityImage = cv2.cvtColor(np.uint8(traversabilityImage), cv2.COLOR_RGB2GRAY)
-        # plt.imsave(segmentationsPath+ "tempExamples4/Seg" + str(imagesTested) + " k" + str(runksize) + "-G.png", np.uint8(traversabilityImage))
-        traversabilityImage = cv2.threshold(traversabilityImage, 1, 1, cv2.THRESH_BINARY)[1]
-        plt.imsave(segmentationsPath + "tempExamples4/Seg" + str(imagesTested) + "k" + str(runksize) + "-T.png", np.uint8(traversabilityImage))
 
-        #print(imagesTested)
-
-        # experimental lidar
-        # outputWithProjectedPoints = lidarProcessor.projectPointsToImage(np.asarray(outputImage), pointCloud.numpy()[0, :, :], int(transformType[0]))
-        # traversabilityImage = lidarProcessor.calculateTraversability(np.asarray(traversabilityImage), pointCloud.numpy()[0, :, :], int(transformType[0]))
-
-
-
-        pathingAreaImage = pathingProcessor.calculatePathingAreaFromTraversableArea(traversabilityImage)
-        combinedTraversabilityAndPathingAreaImage = traversabilityImage + pathingAreaImage
-
-        if pathingType == "StraightLine":
-            numLabels, labels, stats, centerPoints = cv2.connectedComponentsWithStats(pathingAreaImage, connectivity=4)
-
-            pathingStart = time.time()
-            pathingImage, numPaths, pathLength, unsafePathPixels = pathingProcessor.straightLinePathing(traversabilityImage, combinedTraversabilityAndPathingAreaImage, numLabels, stats)
-            cumulativePathingCalculationTime += time.time() - pathingStart
-
-            totalPathLength += pathLength
-            totalNumPaths += numPaths
-            totalUnsafePathPixels += unsafePathPixels
+# ================================
+# Color Lookup Table
+# ================================
 
-            plt.imsave("StraightLinePathingImages/Seg" + str(imagesTested) + "-1.png", np.uint8(outputImage))
-            plt.imsave("StraightLinePathingImages/Seg" + str(imagesTested) + "-S.png", np.uint8(pathingImage))
+color_table = np.array([
+    [51,221,255],
+    [33,160,75],
+    [102,255,102],
+    [144,107,40]
+], dtype=np.uint8)
 
-        elif pathingType == "MyAlg":
-            numLabels, labels, stats, centerPoints = cv2.connectedComponentsWithStats(pathingAreaImage, connectivity=4)
-
-            pathingStart = time.time()
-            pathingImage, numPaths, pathLength, unsafePathPixels = pathingProcessor.MyAlgPathing(combinedTraversabilityAndPathingAreaImage, numLabels, stats)
-            cumulativePathingCalculationTime += time.time() - pathingStart
-
-            totalPathLength += pathLength
-            totalNumPaths += numPaths
-            totalUnsafePathPixels += unsafePathPixels
 
-            plt.imsave("MyAlgPathingImages/Seg" + str(imagesTested) + "-1.png", np.uint8(outputImage))
-            plt.imsave("MyAlgPathingImages/Seg" + str(imagesTested) + "-2.png", np.uint8(pathingImage))
-
-        elif pathingType == "AStar":
-            numLabels, labels, stats, centerPoints = cv2.connectedComponentsWithStats(pathingAreaImage, connectivity=4)
-
-            pathingStart = time.time()
-            pathingImage, numPaths, pathLength = pathingProcessor.AStarPathing(combinedTraversabilityAndPathingAreaImage, numLabels, stats)
-            individualPathTime = time.time() - pathingStart
-            individualTime = time.time() - individualStart
-            imagesTestedName = testDataset.imagesList[imagesTested]
-            print(imagesTestedName)
+# ================================
+# Traversability Mapping
+# ================================
 
-            PathLengthPerImage.append(pathLength)
-            cumulativePathingCalculationTime += time.time() - pathingStart
-            totalPathLength += pathLength
-            totalNumPaths += numPaths
-            with open(('C:/Python/PyTorchSegmentation/TAData/' + str(rundescriptor_abrv) + '.txt'), 'a') as DataTA:
-                DataTA.writelines(','.join([str(imagesTestedName), str(pathLength), str(individualTime), str(individualPathTime)]))
-                #DataTA.writelines('.join([operation, element, str(runksize), str(AvgLength), str(overallTime), tr(cumulativePathingCalculationTime)]))
-                DataTA.write('\n')
-
-            plt.imsave(segmentationsPath + "AStarPathingImages/Seg_" + str(imagesTestedName) + "_" + str(imagesTested) + "k" + str(runksize) + "-out1.png", np.uint8(outputImage))
-            plt.imsave(segmentationsPath + "AStarPathingImages/Seg_" + str(imagesTestedName) + "_" + str(imagesTested) + "k" + str(runksize) + "-out3.png", np.int8(pathingImage))
+traversabilityLookupTable = [
+    [0,0,0],
+    [0,0,0],
+    [0,0,0],
+    [0,0,255]
+]
 
-            # if index in [0, 20, 40, 60, 80, 100, 120]:
-            # plt.imsave(segmentationsPath + "tempExamples4/Seg" + str(imagesTested) + "-3.png", np.uint8(pathingImage))
+for _ in range(256 - len(traversabilityLookupTable)):
+    traversabilityLookupTable.append([0,0,0])
 
-        elif pathingType == "MaxSafe":
-            numLabels, labels, stats, centerPoints = cv2.connectedComponentsWithStats(traversabilityImage, connectivity=4)
-            pathingStart = time.time()
-            pathingImage, numPaths, pathLength = pathingProcessor.MaxSafePathing(traversabilityImage, numLabels, stats)
-            cumulativePathingCalculationTime += time.time() - pathingStart
-
-            totalPathLength += pathLength
-            totalNumPaths += numPaths
+traversabilityLookupTable = np.array([traversabilityLookupTable], dtype=np.uint8)
 
-            plt.imsave("MaxSafePathingImages/Seg" + str(imagesTested) + "-1.png", np.uint8(outputImage))
-            plt.imsave("MaxSafePathingImages/Seg" + str(imagesTested) + "-4.png", np.uint8(pathingImage))
 
-        RuntimePerImage.append(time.time() - individualStart)
-        imagesTested += 1
+# ================================
+# IoU Counters
+# ================================
 
-        overallTime = time.time() - overallStart
-        #print(str(rundescriptor) + "w/" str(runksize) + "x" + str(runksize) + "Kernel")
-        if totalNumPaths != 0:
-            AvgLength = totalPathLength/totalNumPaths
-        else:
-            AvgLength = "totalNumPaths = 0"
-        # if totalPathLength != 0:
-            # print(str((totalUnsafePathPixels / totalPathLength) * 100) + "% of paths was unsafe.")
-        # else:
-            # print("totalPathLength = 0")
+rawIntersectionCounts = torch.zeros(numClasses)
+rawUnionCounts = torch.zeros(numClasses)
 
-        averageTime = overallTime / (imagesTested + 1)
-        averagePathTime = cumulativePathingCalculationTime / (imagesTested + 1)
+morphIntersectionCounts = torch.zeros(numClasses)
+morphUnionCounts = torch.zeros(numClasses)
 
 
+# ================================
+# Path Metrics
+# ================================
 
+cumulativePathingCalculationTime = 0
+totalPathLength = 0
+totalNumPaths = 0
 
+overallStart = time.time()
+imagesTested = 0
 
-        with open(("C:/Python/PyTorchSegmentation/TAData/" + str(rundescriptor_abrv) + '.txt'), 'a') as DataTA:
-            DataTA.writelines(','.join([str(averageTime), str(averagePathTime), str(AvgLength), str(overallTime), str(cumulativePathingCalculationTime)]))
-            #DataTA.writelines(','.join([operation, element, str(runksize), str(AcgLength), str(overallTime), str(cumulativePathingCalculationTime)]))
-            DataTA.write("\n")
 
-        # print("Total runtime was" + str(overallTime) + " Seconds.")
-        # # print("Average runtime per image was " + str(overallTime / (imagesTested+ 1)) + " seconds.")
-        # print("Total pathing runtime was " + str(cumulativePathingCalculationTime) + " seconds.")
-        # print("Average pathing runtime per image was " + str(cumulativePathingCalculationTime / (imagesTested + 1)) + " seconds.")
-        # print("Average path length per image was " + str(totalPathLength) + " pixels.")
+# ================================
+# Evaluation Loop
+# ================================
 
-        # print("GT unique:", torch.unique(target_resized))
-        # print("Pred unique:", torch.unique(rawPred))
+for i,(testBatch,targetBatch) in enumerate(testLoader):
 
-        for c in range(numClasses):
-            predMask = (rawPred == c)
-            targetMask = (target_resized == c)
+    individualStart = time.time()
 
-            inter = torch.logical_and(predMask, targetMask)
-            union = torch.logical_or(predMask, targetMask)
+    testBatch = testBatch.to(device)
 
-            rawIntersectionCounts[c] += inter.sum()
-            rawUnionCounts[c] += union.sum()
+    with torch.no_grad():
+        outputBatch = segmentationModel(testBatch)["out"]
 
-# Metric Plots
-# ---------------- PLOTTING ---------------- #
-# print(PreIoU)
-# print(MorphIoU)
-# print(RuntimePerImage)
-# print(PathLengthPerImage)
-x = np.arange(1, len(RuntimePerImage) + 1)
+    prediction = outputBatch.argmax(1)[0].cpu()
+    target = targetBatch[0].cpu().long()
 
-dataset_iou = torch.sum(rawIntersectionCounts) / torch.sum(rawUnionCounts)
-print("Dataset IoU:", dataset_iou.item())
+    rawMask = prediction.numpy()
+    filename = os.path.splitext(testDataset.imagesList[i])[0]
 
-plt.figure(figsize=(12, 12))
+    # PRE SEGMENTATION SAVE
+    rgbRawMask = color_table[rawMask]
+    plt.imsave(os.path.join(preFolder,filename+"_seg_pre.png"),rgbRawMask)
 
-# 1. Pre IoU
-plt.subplot(4, 1, 1)
-plt.plot(x, PreIoU)
-plt.title("Pre IoU per Image")
-plt.xlabel("Image Number")
-plt.ylabel("IoU")
 
+    # IoU BEFORE MORPH
+    for c in range(numClasses):
 
+        targetMask = (target == c)
+        predMask = (prediction == c)
 
-# 2. Post IoU
-plt.subplot(4, 1, 2)
-plt.plot(x, MorphIoU)
-plt.title("Post Morph IoU per Image")
-plt.xlabel("Image Number")
-plt.ylabel("IoU")
+        inter = torch.logical_and(targetMask,predMask)
+        union = torch.logical_or(targetMask,predMask)
 
+        rawIntersectionCounts[c]+=torch.count_nonzero(inter)
+        rawUnionCounts[c]+=torch.count_nonzero(union)
 
-# 3. Path Length
-plt.subplot(4, 1, 3)
-plt.plot(x, PathLengthPerImage)
-plt.title("Path Length per Image")
-plt.xlabel("Image Number")
-plt.ylabel("Pixels")
 
+    # MORPHOLOGY
+    morphMask = apply_morphology(rawMask.astype(np.uint8))
+    morphMaskTensor = torch.from_numpy(morphMask)
 
-# 4. Runtime
-plt.subplot(4, 1, 4)
-plt.plot(x, RuntimePerImage)
-plt.title("Runtime per Image")
-plt.xlabel("Image Number")
-plt.ylabel("Seconds")
-plt.tight_layout()
-plt.show()
 
-print("\n=== PER CLASS IoU ===")
+    # POST MORPH SAVE
+    rgbMorphMask = color_table[morphMask]
+    plt.imsave(os.path.join(morphFolder,filename+"_seg_morph.png"),rgbMorphMask)
 
-class_means = []
 
-for c in range(numClasses):
-    avg = np.mean(PerClassIoU[c])
-    class_means.append(avg)
-    print(f"Class {c}: {avg:.3f}")
+    # IoU AFTER MORPH
+    for c in range(numClasses):
 
-worst_class = np.argmin(class_means)
-print(f"\nWorst performing class: {worst_class}")
+        targetMask=(target==c)
+        predMask=(morphMaskTensor==c)
+
+        inter=torch.logical_and(targetMask,predMask)
+        union=torch.logical_or(targetMask,predMask)
+
+        morphIntersectionCounts[c]+=torch.count_nonzero(inter)
+        morphUnionCounts[c]+=torch.count_nonzero(union)
+
+
+    # TRAVERSABILITY
+    segRGB=cv2.cvtColor(morphMask.astype(np.uint8),cv2.COLOR_GRAY2RGB)
+
+    traversabilityImage=cv2.LUT(segRGB,traversabilityLookupTable)
+    traversabilityImage=cv2.cvtColor(traversabilityImage,cv2.COLOR_RGB2GRAY)
+    traversabilityImage=cv2.threshold(traversabilityImage,1,1,cv2.THRESH_BINARY)[1]
+
+
+    # SAFETY MARGIN
+    kernel=np.ones((SAFETY_KERNEL_SIZE,SAFETY_KERNEL_SIZE),np.uint8)
+    traversabilityImage=cv2.erode(traversabilityImage,kernel)
+
+
+    # =========================
+    # SAFE REGION COMPUTATION (MOVED UP)
+    # =========================
+
+    h,w=traversabilityImage.shape
+    center=w//2
+
+    # TEMP START (for reachability flood fill)
+    temp_start=None
+    for r in range(h-1,-1,-1):
+        if traversabilityImage[r,center]==1:
+            temp_start=(r,center)
+            break
+
+    if temp_start is None:
+        continue
+
+    # FLOOD FILL TO FIND CONNECTED REGION
+    visited=np.zeros((h,w),dtype=bool)
+    queue=[temp_start]
+    visited[temp_start]=True
+
+    directions=[(1,0),(-1,0),(0,1),(0,-1)]
+
+    while queue:
+        y,x=queue.pop(0)
+
+        for dy,dx in directions:
+            ny=y+dy
+            nx=x+dx
+
+            if ny<0 or ny>=h or nx<0 or nx>=w:
+                continue
+
+            if visited[ny,nx]:
+                continue
+
+            if traversabilityImage[ny,nx]==0:
+                continue
+
+            visited[ny,nx]=True
+            queue.append((ny,nx))
+
+    # ERODE TO CREATE SAFE (VIABLE) REGION
+    marginKernel=np.ones((15,15),np.uint8)
+
+    viableMask=visited.astype(np.uint8)
+    viableMask=cv2.erode(viableMask,marginKernel)
+
+
+    # =========================
+    # START (NOW USING SAFE REGION)
+    # =========================
+
+    start=None
+    for r in range(h-1,-1,-1):
+        if viableMask[r,center]==1:
+            start=(r,center)
+            break
+
+    if start is None:
+        continue
+
+
+    # =========================
+    # GOAL (SAFE REGION)
+    # =========================
+
+    goal=find_furthest_reachable(viableMask,start)
+
+
+    # =========================
+    # COST MAP (SAFE REGION ONLY)
+    # =========================
+
+    costMap=np.where(viableMask==1,1,1000)
+
+
+    # =========================
+    # A*
+    # =========================
+
+    pathingStart=time.time()
+    path=astar(costMap,start,goal)
+    individualPathTime=time.time()-pathingStart
+
+
+    # =========================
+    # VISUALIZATION
+    # =========================
+
+    # IMAGE 1 (UNCHANGED)
+    allTraversable=np.zeros((h,w,3),dtype=np.uint8)
+    allTraversable[traversabilityImage==1]=[255,255,0]
+
+    plt.imsave(os.path.join(pathFolder,filename+"_all_traversable.png"),allTraversable)
+
+
+    # IMAGE 2 (VIABLE MAP)
+    viableMap=np.zeros((h,w,3),dtype=np.uint8)
+
+    # viable = yellow
+    viableMap[viableMask==1]=[255,255,0]
+
+    # removed edges = green
+    mask=(traversabilityImage==1)&(viableMask==0)
+    viableMap[mask]=[0,200,0]
+
+    plt.imsave(os.path.join(pathFolder,filename+"_viable_traversable.png"),viableMap)
+
+
+    # IMAGE 3 (FINAL PATH — SAFE REGION ONLY)
+    pathMap=np.zeros((h,w,3),dtype=np.uint8)
+
+    pathMap[viableMask==1]=[0,200,0]
+
+    for y,x in path:
+        pathMap[y,x]=[255,255,0]
+
+    plt.imsave(os.path.join(pathFolder,filename+"_path_map.png"),pathMap)
+    # ================================
+    # Final Metrics
+    # ================================
+
+    rawClassIoU = rawIntersectionCounts / rawUnionCounts
+    morphClassIoU = morphIntersectionCounts / morphUnionCounts
+
+    rawIoU = torch.sum(rawIntersectionCounts) / torch.sum(rawUnionCounts)
+    morphIoU = torch.sum(morphIntersectionCounts) / torch.sum(morphUnionCounts)
+
+    print("\nRaw IoU per class:", rawClassIoU.tolist())
+    print("Morph IoU per class:", morphClassIoU.tolist())
+
+    print("\nRaw Overall IoU:", rawIoU.item())
+    print("Morphology Overall IoU:", morphIoU.item())
+
+    print("Improvement:", (morphIoU - rawIoU).item())
+
+    individualTime=time.time()-individualStart
+
+    print("Image:",filename)
+    print("Path Length:",len(path))
+    print("Path Time:",individualPathTime)
+    print("Total Image Time:",individualTime)
+    print()
+
+    imagesTested+=1
+
+# ================================
+# FINAL DATASET STATISTICS
+# ================================
+
+overallTime = time.time() - overallStart
+
+# IoU calculations
+rawClassIoU = rawIntersectionCounts / rawUnionCounts
+morphClassIoU = morphIntersectionCounts / morphUnionCounts
+
+rawIoU = torch.sum(rawIntersectionCounts) / torch.sum(rawUnionCounts)
+morphIoU = torch.sum(morphIntersectionCounts) / torch.sum(morphUnionCounts)
+
+# Path statistics
+if totalNumPaths != 0:
+    AvgPathLength = totalPathLength / totalNumPaths
+else:
+    AvgPathLength = 0
+
+if imagesTested != 0:
+    AvgRuntimePerImage = overallTime / imagesTested
+    AvgPathTimePerImage = cumulativePathingCalculationTime / imagesTested
+else:
+    AvgRuntimePerImage = 0
+    AvgPathTimePerImage = 0
+
+
+print("\n===============================")
+print("DATASET SUMMARY STATISTICS")
+print("===============================")
+
+print("\nSegmentation Performance:")
+print("Raw IoU per class:", rawClassIoU.tolist())
+print("Morph IoU per class:", morphClassIoU.tolist())
+
+print("\nRaw Overall IoU:", rawIoU.item())
+print("Morphology Overall IoU:", morphIoU.item())
+print("IoU Improvement:", (morphIoU - rawIoU).item())
+
+print("\nPath Planning Performance:")
+print("Total Runtime (entire dataset):", overallTime)
+print("Average Runtime per Image:", AvgRuntimePerImage)
+
+print("Total Pathing Time:", cumulativePathingCalculationTime)
+print("Average Path Time per Image:", AvgPathTimePerImage)
+
+print("Average Path Length:", AvgPathLength)
+print("Images Processed:", imagesTested)
